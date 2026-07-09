@@ -79,15 +79,17 @@ def run_pipeline(raw_path: str, enrolled_path: str, targets_path: str):
         file_month = date_match.group(2).capitalize()
         file_year = int(date_match.group(3))
 
-        # Standard dynamic calendar assignment for the active month
         CYCLE_MONTH = file_month
         CYCLE_YEAR = file_year
         YESTERDAY_DAY = file_day
+        print(f"🎯 Date parsed successfully from filename: {CYCLE_MONTH} {CYCLE_YEAR} (Day {YESTERDAY_DAY})")
     else:
-        # UPDATED: Safe manual fallback anchor now rolls over to June 2026
+        # HARDENED FALLBACK: If filename doesn't contain a date, default to July 2026
         CYCLE_MONTH = 'July'
         CYCLE_YEAR = 2026
-        YESTERDAY_DAY = 2
+        YESTERDAY_DAY = 6  # Changed to 6 so it matches 'Yesterday' relative to July 7th
+        print(
+            f"⚠️ Filename date regex match failed! Falling back to manual anchor: {CYCLE_MONTH} {CYCLE_YEAR} (Day {YESTERDAY_DAY})")
 
     # Absolute Calendar Math Parameters Anchor
     month_idx = list(calendar.month_name).index(CYCLE_MONTH)
@@ -1714,6 +1716,22 @@ def run_pipeline(raw_path: str, enrolled_path: str, targets_path: str):
 
     target_month_int = month_to_num.get(str(CYCLE_MONTH).strip().lower(), 5)
     target_year_int = int(float(str(CYCLE_YEAR).strip()))
+    # ═══════════════════════════════════════════════════════════
+    # NEW STEP 3 DIAGNOSTIC LOGS
+    # ═══════════════════════════════════════════════════════════
+    print("\n🔍 ═══ STEP 3: ENROLLED DATA DIAGNOSTIC ═══")
+    print(f"Pipeline is looking for rows matching: Month = {target_month_int} and Year = {target_year_int}")
+
+    if 'DER_Month_Int' in df_enrolled.columns:
+        print("\nBreakdown of months found in your Enrolled CSV column 'DER Month' (Parsed):")
+        print(df_enrolled['DER_Month_Int'].value_counts().to_string())
+    else:
+        print("\n❌ CRITICAL: 'DER_Month_Int' was not computed properly.")
+
+    if 'DER_Year_Int' in df_enrolled.columns:
+        print("\nBreakdown of years found in your Enrolled CSV column 'DER Year' (Parsed):")
+        print(df_enrolled['DER_Year_Int'].value_counts().to_string())
+    print("═════════════════════════════════════════════════════\n")
 
     # ============================================================
     # GET METRICS FUNCTION (STRICT CHANNELS ONLY)
@@ -1852,8 +1870,13 @@ def run_pipeline(raw_path: str, enrolled_path: str, targets_path: str):
         df_temp = df_temp.merge(t_clean, on='University', how='left')
         df_temp['Overall Target'] = pd.to_numeric(df_temp['Overall Target'], errors='coerce').fillna(0).astype(int)
         df_temp['Till Date Target'] = pd.to_numeric(df_temp['Till Date Target'], errors='coerce').fillna(0).astype(int)
-        df_temp['Remaining Target'] = df_temp['Till Date Target'] - df_temp['Delivered']
 
+        # Safe remaining tracking calculation so missing targets don't break front-end dashboard rendering logic
+        df_temp['Remaining Target'] = df_temp.apply(
+            lambda r: (r['Till Date Target'] - r['Delivered']) if r['Till Date Target'] > 0 else 0,
+            axis=1
+        )
+        
         f_cols = ['Branch', 'University', 'Segment', 'Overall Target', 'Till Date Target', 'Remaining Target',
                   'Delivered', 'Workable', 'Prospect', 'Fresh', 'Junk', 'Current Adm', 'Spillover', 'Total Adm',
                   'CVR %', 'Junk %']

@@ -13,17 +13,21 @@ Then open:
     http://127.0.0.1:8000
 """
 
+import json
 import os
 import shutil
 import traceback
 from datetime import datetime
 
+import pandas as pd
 from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response, JSONResponse
 from sqlalchemy import text
 
 from process_reports import run_pipeline
+from daily_tracker import run_daily_tracker, TABLE_MAP as DAILY_TABLE_MAP
 from database import engine
+from db_writer import SHEET_TABLE_MAP
 
 app = FastAPI(title="Growth Funnel Report Portal")
 
@@ -78,7 +82,7 @@ FORM_HTML = f"""
 
   <button type="submit">Process &amp; Save to Postgres</button>
 </form>
-<p style="margin-top:30px;"><a href="/history">View recent runs</a></p>
+<p style="margin-top:30px;"><a href="/history">View recent runs</a> &nbsp;|&nbsp; <a href="/api/dashboards">API: list tables</a></p>
 {PAGE_TAIL}
 """
 
@@ -129,10 +133,37 @@ async def upload(
         {PAGE_TAIL}
         """
 
+    # Daily tracker runs separately from the monthly pipeline above -- if
+    # this fails, we still show the monthly result as a success and just
+    # surface the daily tracker error alongside it, instead of losing both.
+    daily_result = None
+    daily_error = None
+    try:
+        daily_result = run_daily_tracker(raw_path, enrolled_path)
+    except Exception:
+        daily_error = traceback.format_exc()
+
     rows_html = "".join(
         f"<tr><td>{name}</td><td>{count}</td></tr>"
         for name, count in result["sheets"].items()
     )
+
+    daily_html = ""
+    if daily_result:
+        daily_html = f"""
+        <div class="success" style="margin-top:16px;">
+          Daily tracker snapshot: {daily_result['snapshot_date']}
+          (raw as of {daily_result['raw_snapshot_date']}, enrolled as of {daily_result['enrolled_snapshot_date']})<br>
+          History now spans {daily_result['days_in_history']} day(s).
+        </div>
+        """
+    elif daily_error:
+        daily_html = f"""
+        <div class="error" style="margin-top:16px;">
+          Daily tracker step failed (monthly dashboards above still saved fine):
+          {daily_error}
+        </div>
+        """
 
     return f"""
     {PAGE_HEAD}
@@ -141,6 +172,7 @@ async def upload(
       Cycle: {result['cycle_month']} {result['cycle_year']}<br>
       Upload ID: {result['upload_id']}
     </div>
+    {daily_html}
     <table>
       <tr><th>Table</th><th>Rows</th></tr>
       {rows_html}
@@ -176,3 +208,137 @@ def history():
     <p style="margin-top:20px;"><a href="/">&larr; Back to upload</a></p>
     {PAGE_TAIL}
     """
+
+
+# ============================================================
+# JSON API — for Google Apps Script / any external dashboard to pull
+# the latest data. No auth for now (per your call) -- anyone with the
+# URL can read this. Add an API key later if this ever leaves your
+# own network.
+# ============================================================
+
+# Every table this endpoint is allowed to read. Deliberately an
+# allowlist, not "whatever table name you pass in" -- avoids letting
+# a URL query an arbitrary table in your database.
+ALLOWED_TABLES = set(SHEET_TABLE_MAP.values()) | set(DAILY_TABLE_MAP.values()) | {"subsource_dashboard", "upload_history"}
+
+
+@app.get("/api/dashboards")
+def list_dashboards():
+    """GET /api/dashboards -- lists every table name you can query below."""
+    return JSONResponse(sorted(ALLOWED_TABLES))
+
+
+@app.get("/api/dashboard/{table_name}")
+def get_dashboard(table_name: str):
+    """
+    GET /api/dashboard/overall_dashboard
+    Returns that table's current contents as JSON. Since every monthly
+    table is fully overwritten on each pipeline run (if_exists="replace"),
+    this always reflects the latest upload -- no extra filtering needed.
+
+    From Apps Script:
+        UrlFetchApp.fetch("http://YOUR_SERVER:8000/api/dashboard/overall_dashboard")
+    """
+    if table_name not in ALLOWED_TABLES:
+        return JSONResponse(
+            {"error": f"'{table_name}' isn't a recognized table.", "available": sorted(ALLOWED_TABLES)},
+            status_code=404,
+        )
+
+    try:
+        df = pd.read_sql(f'SELECT * FROM "{table_name}"', engine)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+    # to_json (not a plain dict) so Timestamps/NaN/numpy types serialize cleanly
+    return Response(content=df.to_json(orient="records", date_format="iso"), media_type="application/json")
+
+
+# ============================================================
+# /dashboard/{month} — the endpoint your Apps Script Code.gs is
+# ALREADY calling (as "https://.../dashboard/july"). Code.gs needs
+# no changes; this is the piece that was missing on this side.
+#
+# Shape must match sheet.getDataRange().getValues(): each tab is an
+# array of rows, the first row being headers -- so Code.gs's
+# monthlyPayload["July"] = julyData.data behaves identically whether
+# a tab came from a real Google Sheet or from here.
+# ============================================================
+
+# Exact tab names your Code.gs's EXPECTED_TABS list asks for.
+EXPECTED_TABS = [
+    "Enhanced Branch Report",
+    "Enhanced University Report",
+    "Overall Dashboard",
+    "PR Dashboard",
+    "Whatsapp Dashboard",
+    "AI Meeting Dashboard",
+    "Website Dashboard",
+    "Live Chat Dashboard",
+    "RDMPL Dashboard",
+    "Website Campaign Dashboard",
+    "Subsource Dashboard",
+    "Product Dashboard",
+]
+
+# Same mapping db_writer.py uses, plus Subsource Dashboard, which is
+# written by update_subsource.py instead of the main pipeline.
+TAB_TABLE_MAP = dict(SHEET_TABLE_MAP)
+TAB_TABLE_MAP["Subsource Dashboard"] = "subsource_dashboard"
+
+
+def _df_to_sheet_values(df: pd.DataFrame):
+    """[header_row, *data_rows] -- the same shape Google Sheets'
+    getDataRange().getValues() returns, so Code.gs can't tell the
+    difference between a real sheet tab and this API."""
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            df[col] = df[col].astype(str)
+    # route through pandas' own JSON encoder (handles NaN/Timestamps/
+    # numpy types correctly) instead of hand-rolling type conversion
+    split = json.loads(df.to_json(orient="split", date_format="iso"))
+    return [split["columns"]] + split["data"]
+
+
+@app.get("/dashboard/{month}")
+def get_month_dashboard(month: str):
+    """
+    GET /dashboard/july
+    Returns { data: { "Enhanced Branch Report": [[...]], ... } } for
+    every tab in EXPECTED_TABS. Since your monthly Postgres tables only
+    ever hold the CURRENT cycle's data (each upload replaces the last),
+    this always returns whatever was most recently uploaded -- the
+    {month} in the URL doesn't select a specific month's history, it's
+    just there because that's the URL Code.gs already calls. If the
+    month in the URL doesn't match the most recent upload's actual
+    cycle, `warning` tells you so instead of failing silently.
+    """
+    data = {}
+    for tab in EXPECTED_TABS:
+        table_name = TAB_TABLE_MAP.get(tab)
+        if not table_name:
+            data[tab] = []
+            continue
+        try:
+            df = pd.read_sql(f'SELECT * FROM "{table_name}"', engine)
+            df = df.drop(columns=[c for c in ("_upload_id", "_run_timestamp") if c in df.columns])
+            data[tab] = _df_to_sheet_values(df)
+        except Exception as e:
+            # Table doesn't exist yet (e.g. nothing uploaded this cycle) --
+            # return an empty tab instead of failing the whole dashboard.
+            data[tab] = []
+
+    warning = None
+    try:
+        with engine.connect() as conn:
+            latest = conn.execute(text("""
+                SELECT cycle_month, cycle_year FROM upload_history
+                ORDER BY run_timestamp DESC LIMIT 1
+            """)).fetchone()
+        if latest and latest.cycle_month and latest.cycle_month.lower() != month.lower():
+            warning = f"Requested '{month}' but the most recent upload was {latest.cycle_month} {latest.cycle_year}."
+    except Exception:
+        pass
+
+    return JSONResponse({"success": True, "month_requested": month, "warning": warning, "data": data})
