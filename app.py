@@ -25,7 +25,7 @@ from fastapi.responses import HTMLResponse, Response, JSONResponse
 from sqlalchemy import text
 
 from process_reports import run_pipeline
-from daily_tracker import run_daily_tracker, TABLE_MAP as DAILY_TABLE_MAP
+from daily_tracker import run_daily_tracker, backfill_daily_history, TABLE_MAP as DAILY_TABLE_MAP
 from database import engine
 from db_writer import SHEET_TABLE_MAP
 
@@ -80,6 +80,18 @@ FORM_HTML = f"""
   <input type="file" name="targets_file" accept=".xlsx">
   <div class="note">Optional -- only upload this when your targets change. Otherwise the last one you uploaded will be reused automatically.</div>
 
+  <label style="display:flex; align-items:center; gap:8px; font-weight:400; margin-top:18px;">
+    <input type="checkbox" name="backfill_daily" value="yes" style="margin:0;">
+    Backfill Daily Tracker history from the 1st of the month
+  </label>
+  <div class="note">
+    Reconstructs one row per day using each lead's own Created On date. Delivered/Admissions
+    counts are accurate historically; Workable/Prospect/Fresh/Junk for past days reflect each
+    lead's CURRENT stage, not its actual stage back then (your CSV only stores one live
+    snapshot, not a stage history) -- those days are tagged so they're never confused with a
+    real day-by-day capture. Leave unchecked for a normal single-day update.
+  </div>
+
   <button type="submit">Process &amp; Save to Postgres</button>
 </form>
 <p style="margin-top:30px;"><a href="/history">View recent runs</a> &nbsp;|&nbsp; <a href="/api/dashboards">API: list tables</a></p>
@@ -97,6 +109,7 @@ async def upload(
     raw_file: UploadFile = File(...),
     enrolled_file: UploadFile = File(...),
     targets_file: UploadFile = None,
+    backfill_daily: str = None,
 ):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -139,7 +152,10 @@ async def upload(
     daily_result = None
     daily_error = None
     try:
-        daily_result = run_daily_tracker(raw_path, enrolled_path)
+        if backfill_daily == "yes":
+            daily_result = backfill_daily_history(raw_path, enrolled_path)
+        else:
+            daily_result = run_daily_tracker(raw_path, enrolled_path)
     except Exception:
         daily_error = traceback.format_exc()
 
@@ -149,7 +165,17 @@ async def upload(
     )
 
     daily_html = ""
-    if daily_result:
+    if daily_result and daily_result.get("backfilled"):
+        start, end = daily_result["backfilled_range"]
+        daily_html = f"""
+        <div class="success" style="margin-top:16px;">
+          Backfilled {daily_result['backfilled_days']} day(s): {start} → {end}<br>
+          History now spans {daily_result['days_in_history']} day(s) total.<br>
+          <span style="opacity:0.8;">Days before {daily_result['snapshot_date']} are reconstructed (accurate
+          Delivered/Admissions, approximate Workable/Prospect/Fresh/Junk) -- tagged _backfilled in daily_snapshots.</span>
+        </div>
+        """
+    elif daily_result:
         daily_html = f"""
         <div class="success" style="margin-top:16px;">
           Daily tracker snapshot: {daily_result['snapshot_date']}
@@ -342,3 +368,37 @@ def get_month_dashboard(month: str):
         pass
 
     return JSONResponse({"success": True, "month_requested": month, "warning": warning, "data": data})
+
+
+# ============================================================
+# /daily-tracker/{month} — same idea as /dashboard/{month}, but for
+# the Overall_Dashboard + Track_* tables daily_tracker.py writes.
+# Point Code.gs's DAILY_TRACKER_SHEETS at this instead of a Google
+# Sheet ID once you want a given month live-synced from Neon.
+# ============================================================
+
+DAILY_TRACKER_TABS = [
+    "Overall_Dashboard", "Track_PR", "Track_WhatsApp",
+    "Track_AIMeeting", "Track_Website", "Track_LiveChat", "Track_RDMPL",
+]
+
+
+@app.get("/daily-tracker/{month}")
+def get_daily_tracker(month: str):
+    """
+    GET /daily-tracker/july
+    Same {data: {tab: [[...]]}} shape as /dashboard/{month}, sourced
+    from daily_tracker.py's tables instead of the monthly ones.
+    """
+    data = {}
+    for tab in DAILY_TRACKER_TABS:
+        table_name = DAILY_TABLE_MAP.get(tab)
+        if not table_name:
+            data[tab] = []
+            continue
+        try:
+            df = pd.read_sql(f'SELECT * FROM "{table_name}"', engine)
+            data[tab] = _df_to_sheet_values(df)
+        except Exception:
+            data[tab] = []
+    return JSONResponse({"success": True, "month_requested": month, "data": data})

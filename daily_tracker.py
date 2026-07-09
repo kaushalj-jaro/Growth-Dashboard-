@@ -115,6 +115,7 @@ TABLE_MAP = {
     'Source_Trend': 'Source_Trend',
     'Source_Admissions_Trend': 'Source_Admissions_Trend',
     'Full_Delta_Detail': 'Full_Delta_Detail',
+    'Month_To_Date_Summary': 'Month_To_Date_Summary',
     # 'Full_History' is intentionally skipped -- it's identical to Daily_Snapshots
     'Overall_Dashboard': 'daily_overall_dashboard',  # renamed to avoid clobbering the monthly table
     'Track_WhatsApp': 'Track_WhatsApp',
@@ -184,10 +185,13 @@ def to_int_safe(val):
         return -1
 
 
-def run_daily_tracker(raw_path: str, enrolled_path: str):
-    # ============================================================
-    # STEP 1 — LOAD + DERIVE SNAPSHOT DATE FROM DATA, NOT FILE NAMES
-    # ============================================================
+def _prepare_data(raw_path: str, enrolled_path: str):
+    """
+    Load, clean, segment, and build combos ONCE. Both a normal live run
+    and a backfill run share this exact same preparation -- there's only
+    one code path for "what does the data look like", so the two modes
+    can never silently drift apart from each other.
+    """
     df_raw = pd.read_csv(raw_path, low_memory=False)
     df_enrolled = pd.read_csv(enrolled_path, low_memory=False)
     df_raw.columns = df_raw.columns.str.strip()
@@ -223,9 +227,6 @@ def run_daily_tracker(raw_path: str, enrolled_path: str):
     print(f"Enrolled side (max 'Modified On') : {ENROLLED_SNAPSHOT_DATE}")
     print(f"SNAPSHOT_DATE in use              : {SNAPSHOT_DATE}")
 
-    # ============================================================
-    # STEP 2 — CLEAN + SEGMENT (same normalization as your notebook)
-    # ============================================================
     df_raw = clean_dataset(df_raw, is_enrolled=False)
     df_enrolled = clean_dataset(df_enrolled, is_enrolled=True)
 
@@ -259,6 +260,17 @@ def run_daily_tracker(raw_path: str, enrolled_path: str):
     df_raw.loc[df_raw['Segment'] == 'Free Courses', 'University'] = 'Jaro Education'
     df_raw.loc[df_raw['Segment'] == 'Free Courses', 'OFS 1 - Primary University'] = ''
     df_enrolled.loc[df_enrolled['Opportunity Id'].isin(free_course_ids), 'University'] = 'Jaro Education'
+
+    # Month-scope the raw leads: only leads CREATED this month count,
+    # same principle admissions already used. Rows with an unparseable
+    # date are kept rather than dropped, but logged.
+    if 'Created On' in df_raw.columns:
+        _before = len(df_raw)
+        _undated = df_raw['Created On'].isna().sum()
+        df_raw = df_raw[df_raw['Created On'].isna() | (df_raw['Created On'] >= pd.to_datetime(CYCLE_START))].copy()
+        _dropped = _before - len(df_raw)
+        print(f"📅 Month-scoped raw leads to {CYCLE_MONTH} {CYCLE_YEAR}: kept {len(df_raw)}/{_before} rows "
+              f"({_dropped} from prior months excluded, {_undated} with no parseable date kept as-is)")
 
     isolated_lc_raw = df_raw[df_raw['Opportunity Source'].str.lower() == 'live chat'].copy()
     isolated_lc_enrolled = df_enrolled[df_enrolled['Opportunity Source'].str.lower() == 'live chat'].copy()
@@ -300,77 +312,113 @@ def run_daily_tracker(raw_path: str, enrolled_path: str):
 
     combos = pd.DataFrame(valid_combos).sort_values(['Segment', 'Branch', 'University']).reset_index(drop=True)
 
-    # ============================================================
-    # STEP 3 — METRIC ENGINE + TODAY'S SNAPSHOT ROWS
-    # ============================================================
-    def get_metrics(branch, university, segment, source_filter=None):
-        if source_filter == 'Live Chat':
-            working_raw, working_enr = isolated_lc_raw, isolated_lc_enrolled
+    return {
+        'df_raw': df_raw, 'df_enrolled': df_enrolled,
+        'isolated_lc_raw': isolated_lc_raw, 'isolated_lc_enrolled': isolated_lc_enrolled,
+        'combos': combos, 'target_month_int': target_month_int,
+        'CYCLE_START': CYCLE_START, 'CYCLE_MONTH': CYCLE_MONTH, 'CYCLE_YEAR': CYCLE_YEAR,
+        'SNAPSHOT_DATE': SNAPSHOT_DATE, 'RAW_SNAPSHOT_DATE': RAW_SNAPSHOT_DATE,
+        'ENROLLED_SNAPSHOT_DATE': ENROLLED_SNAPSHOT_DATE,
+    }
+
+
+def _get_metrics(prep, branch, university, segment, source_filter=None, as_of_date=None):
+    """
+    Same metric engine as before, plus an optional as_of_date cutoff used
+    only by backfill: when set, both raw leads and admissions are capped
+    to "Created On <= end of as_of_date", reconstructing what the numbers
+    would have looked like on that historical day. When as_of_date is
+    None (the normal live run), behavior is identical to before -- there's
+    nothing beyond today in the file anyway.
+    """
+    if source_filter == 'Live Chat':
+        working_raw, working_enr = prep['isolated_lc_raw'], prep['isolated_lc_enrolled']
+    else:
+        working_raw, working_enr = prep['df_raw'], prep['df_enrolled']
+
+    if university == 'Any':
+        if source_filter == 'AI Meeting':
+            raw_mask = (working_raw['Opportunity Source'] == 'AI Meeting') & \
+                       (working_raw['University'] == 'Any') & \
+                       (working_raw['OFS 1 - Primary University'].isin(['', 'Any']) | working_raw['OFS 1 - Primary University'].isna())
         else:
-            working_raw, working_enr = df_raw, df_enrolled
+            raw_mask = (working_raw['University'] == 'Any') & ((working_raw['OFS 1 - Primary University'] == '') | (working_raw['OFS 1 - Primary University'] == 'Any') | (working_raw['OFS 1 - Primary University'].isna()))
+    else:
+        raw_mask = (working_raw['University'] == university) | ((working_raw['University'] == 'Any') & (working_raw['OFS 1 - Primary University'] == university))
 
-        if university == 'Any':
-            if source_filter == 'AI Meeting':
-                raw_mask = (working_raw['Opportunity Source'] == 'AI Meeting') & \
-                           (working_raw['University'] == 'Any') & \
-                           (working_raw['OFS 1 - Primary University'].isin(['', 'Any']) | working_raw['OFS 1 - Primary University'].isna())
-            else:
-                raw_mask = (working_raw['University'] == 'Any') & ((working_raw['OFS 1 - Primary University'] == '') | (working_raw['OFS 1 - Primary University'] == 'Any') | (working_raw['OFS 1 - Primary University'].isna()))
-        else:
-            raw_mask = (working_raw['University'] == university) | ((working_raw['University'] == 'Any') & (working_raw['OFS 1 - Primary University'] == university))
-
-        if source_filter == 'RDMPL':
-            raw_temp = working_raw[(working_raw['Branch'] == branch) & (working_raw['University'] == university) & (working_raw['Opportunity Source'] == 'RDMPL')].copy()
-        elif source_filter == 'Live Chat':
-            raw_temp = working_raw[(working_raw['Branch'] == branch) & (working_raw['University'] == university) & (working_raw['Opportunity Source'] == 'Live Chat')].copy()
-        else:
-            raw_temp = working_raw[(working_raw['Branch'] == branch) & (working_raw['Segment'] == segment) & raw_mask].copy()
-            if source_filter is None:
-                raw_temp = raw_temp[raw_temp['Opportunity Source'] != 'Live Chat']
-            else:
-                raw_temp = raw_temp[raw_temp['Opportunity Source'] == source_filter]
-
-        if 'Opportunity Id' in raw_temp.columns:
-            raw_temp = raw_temp.drop_duplicates(subset=['Opportunity Id'])
-
-        enr_temp = working_enr[(working_enr['Final Branch'] == branch) & (working_enr['Segment'] == segment) & (working_enr['DER_Month_Int'] == target_month_int) & (working_enr['University'] == university)].copy()
+    if source_filter == 'RDMPL':
+        raw_temp = working_raw[(working_raw['Branch'] == branch) & (working_raw['University'] == university) & (working_raw['Opportunity Source'] == 'RDMPL')].copy()
+    elif source_filter == 'Live Chat':
+        raw_temp = working_raw[(working_raw['Branch'] == branch) & (working_raw['University'] == university) & (working_raw['Opportunity Source'] == 'Live Chat')].copy()
+    else:
+        raw_temp = working_raw[(working_raw['Branch'] == branch) & (working_raw['Segment'] == segment) & raw_mask].copy()
         if source_filter is None:
-            enr_temp = enr_temp[enr_temp['Opportunity Source'] != 'Live Chat']
+            raw_temp = raw_temp[raw_temp['Opportunity Source'] != 'Live Chat']
         else:
-            enr_temp = enr_temp[enr_temp['Opportunity Source'] == source_filter]
-        if 'Opportunity Id' in enr_temp.columns:
-            enr_temp = enr_temp.drop_duplicates(subset=['Opportunity Id'])
+            raw_temp = raw_temp[raw_temp['Opportunity Source'] == source_filter]
 
-        delivered = len(raw_temp)
-        workable = len(raw_temp[raw_temp['Stage'].isin(WORKABLE)])
-        prospect = len(raw_temp[raw_temp['Stage'].isin(PROSPECT)])
-        fresh = len(raw_temp[raw_temp['Stage'].isin(FRESH)])
-        junk = len(raw_temp[raw_temp['Stage'].isin(JUNK)])
+    if 'Opportunity Id' in raw_temp.columns:
+        raw_temp = raw_temp.drop_duplicates(subset=['Opportunity Id'])
 
-        enr_temp['Created On'] = pd.to_datetime(enr_temp['Created On'], dayfirst=True, errors='coerce')
-        valid_dates = enr_temp.dropna(subset=['Created On'])
-        failed_dates_count = len(enr_temp) - len(valid_dates)
+    enr_temp = working_enr[(working_enr['Final Branch'] == branch) & (working_enr['Segment'] == segment) & (working_enr['DER_Month_Int'] == prep['target_month_int']) & (working_enr['University'] == university)].copy()
+    if source_filter is None:
+        enr_temp = enr_temp[enr_temp['Opportunity Source'] != 'Live Chat']
+    else:
+        enr_temp = enr_temp[enr_temp['Opportunity Source'] == source_filter]
+    if 'Opportunity Id' in enr_temp.columns:
+        enr_temp = enr_temp.drop_duplicates(subset=['Opportunity Id'])
 
-        current_adm = len(valid_dates[valid_dates['Created On'] >= pd.to_datetime(CYCLE_START)]) + failed_dates_count
-        spillover = len(valid_dates[valid_dates['Created On'] < pd.to_datetime(CYCLE_START)])
-        total_adm = current_adm + spillover
+    if as_of_date is not None:
+        cutoff = pd.to_datetime(as_of_date) + pd.Timedelta(days=1)  # end of that day
+        if 'Created On' in raw_temp.columns:
+            raw_temp = raw_temp[raw_temp['Created On'].isna() | (raw_temp['Created On'] < cutoff)]
+        enr_temp = enr_temp[pd.to_datetime(enr_temp['Created On'], dayfirst=True, errors='coerce') < cutoff]
 
-        cvr = round((total_adm / delivered) * 100, 2) if delivered > 0 else 0
-        junk_pct = round((junk / delivered) * 100, 2) if delivered > 0 else 0
+    delivered = len(raw_temp)
+    workable = len(raw_temp[raw_temp['Stage'].isin(WORKABLE)])
+    prospect = len(raw_temp[raw_temp['Stage'].isin(PROSPECT)])
+    fresh = len(raw_temp[raw_temp['Stage'].isin(FRESH)])
+    junk = len(raw_temp[raw_temp['Stage'].isin(JUNK)])
 
-        return {
-            'Delivered': delivered, 'Workable': workable, 'Prospect': prospect, 'Fresh': fresh, 'Junk': junk,
-            'Current Adm': current_adm, 'Spillover': spillover, 'Total Adm': total_adm, 'CVR %': cvr, 'Junk %': junk_pct
-        }
+    enr_temp = enr_temp.copy()
+    enr_temp['Created On'] = pd.to_datetime(enr_temp['Created On'], dayfirst=True, errors='coerce')
+    valid_dates = enr_temp.dropna(subset=['Created On'])
+    failed_dates_count = len(enr_temp) - len(valid_dates)
+
+    current_adm = len(valid_dates[valid_dates['Created On'] >= pd.to_datetime(prep['CYCLE_START'])]) + failed_dates_count
+    spillover = len(valid_dates[valid_dates['Created On'] < pd.to_datetime(prep['CYCLE_START'])])
+    total_adm = current_adm + spillover
+
+    cvr = round((total_adm / delivered) * 100, 2) if delivered > 0 else 0
+    junk_pct = round((junk / delivered) * 100, 2) if delivered > 0 else 0
+
+    return {
+        'Delivered': delivered, 'Workable': workable, 'Prospect': prospect, 'Fresh': fresh, 'Junk': junk,
+        'Current Adm': current_adm, 'Spillover': spillover, 'Total Adm': total_adm, 'CVR %': cvr, 'Junk %': junk_pct
+    }
+
+
+def _build_snapshot_df(prep, as_of_date=None):
+    """
+    Builds one snapshot row per Branch x University x Segment, either for
+    today (as_of_date=None) or for a historical cutoff (backfill).
+    Tags every row with `_backfilled`: True only for a STRICTLY PAST cutoff
+    (Workable/Prospect/Fresh/Junk there reflect today's current stage, not
+    the actual historical stage). The day equal to SNAPSHOT_DATE itself is
+    never tagged backfilled, since that IS the real live capture.
+    """
+    snapshot_date = as_of_date if as_of_date is not None else prep['SNAPSHOT_DATE']
+    is_backfilled = as_of_date is not None and as_of_date < prep['SNAPSHOT_DATE']
 
     rows = []
-    for _, combo in combos.iterrows():
+    for _, combo in prep['combos'].iterrows():
         branch, university, segment = combo['Branch'], combo['University'], combo['Segment']
-        channel_metrics = {src: get_metrics(branch, university, segment, source_filter=src) for src in SOURCES}
-        overall = get_metrics(branch, university, segment, source_filter=None)
+        channel_metrics = {src: _get_metrics(prep, branch, university, segment, source_filter=src, as_of_date=as_of_date) for src in SOURCES}
+        overall = _get_metrics(prep, branch, university, segment, source_filter=None, as_of_date=as_of_date)
 
         row = {
-            'Snapshot Date': str(SNAPSHOT_DATE), 'Branch': branch, 'University': university, 'Segment': segment,
+            'Snapshot Date': str(snapshot_date), 'Branch': branch, 'University': university, 'Segment': segment,
+            '_backfilled': is_backfilled,
             'Delivered': overall['Delivered'], 'Workable': overall['Workable'], 'Prospect': overall['Prospect'],
             'Fresh': overall['Fresh'], 'Junk': overall['Junk'], 'Current Adm': overall['Current Adm'],
             'Spillover': overall['Spillover'], 'Total Adm': overall['Total Adm'], 'CVR %': overall['CVR %'], 'Junk %': overall['Junk %'],
@@ -390,31 +438,52 @@ def run_daily_tracker(raw_path: str, enrolled_path: str):
             row[prefix + 'Junk_pct'] = m['Junk %']
         rows.append(row)
 
-    today_df = pd.DataFrame(rows)
+    snap_df = pd.DataFrame(rows)
 
-    dynamic_ai_target = len(df_raw[df_raw['Opportunity Source'] == 'AI Meeting'])
-    current_ai_total = today_df['AI_Meeting_Delivered'].sum()
+    dynamic_ai_target = len(prep['df_raw'][
+        (prep['df_raw']['Opportunity Source'] == 'AI Meeting') &
+        (as_of_date is None or (prep['df_raw']['Created On'].isna() | (prep['df_raw']['Created On'] < pd.to_datetime(as_of_date) + pd.Timedelta(days=1))))
+    ])
+    current_ai_total = snap_df['AI_Meeting_Delivered'].sum()
     if current_ai_total != dynamic_ai_target:
         discrepancy = dynamic_ai_target - current_ai_total
-        any_idx = today_df[today_df['University'] == 'Any'].index
+        any_idx = snap_df[snap_df['University'] == 'Any'].index
         if not any_idx.empty:
-            today_df.loc[any_idx[0], 'AI_Meeting_Delivered'] += discrepancy
-            today_df.loc[any_idx[0], 'AI_Meeting_Total_Adm'] = today_df.loc[any_idx[0], 'AI_Meeting_Current_Adm'] + today_df.loc[any_idx[0], 'AI_Meeting_Spillover']
-            today_df.loc[any_idx[0], 'Delivered'] += discrepancy
+            snap_df.loc[any_idx[0], 'AI_Meeting_Delivered'] += discrepancy
+            snap_df.loc[any_idx[0], 'AI_Meeting_Total_Adm'] = snap_df.loc[any_idx[0], 'AI_Meeting_Current_Adm'] + snap_df.loc[any_idx[0], 'AI_Meeting_Spillover']
+            snap_df.loc[any_idx[0], 'Delivered'] += discrepancy
 
-    print(f"✅ Step 3 snapshot rows built: {len(today_df)}")
+    return snap_df
 
-    # ============================================================
-    # STEP 4 — OVERWRITE TODAY'S ROWS IN daily_snapshots (append history)
-    # ============================================================
+
+def _upsert_snapshot(snap_df, snapshot_date):
+    """Deletes any existing rows for this date, then inserts the fresh
+    ones -- same-day reruns overwrite that day only, every other day in
+    the history stays untouched. Also self-heals the table schema if a
+    column (like the new `_backfilled` flag) doesn't exist yet on a
+    table created by an older version of this script."""
     with engine.begin() as conn:
         table_exists = conn.execute(text("SELECT to_regclass('public.daily_snapshots')")).scalar()
         if table_exists:
-            conn.execute(text('DELETE FROM daily_snapshots WHERE "Snapshot Date" = :d'), {"d": str(SNAPSHOT_DATE)})
+            existing_cols = {row[0] for row in conn.execute(text("""
+                SELECT column_name FROM information_schema.columns WHERE table_name = 'daily_snapshots'
+            """))}
+            for col in snap_df.columns:
+                if col not in existing_cols:
+                    dtype = snap_df[col].dtype
+                    pg_type = ('BOOLEAN' if dtype == bool else
+                               'DOUBLE PRECISION' if dtype.kind == 'f' else
+                               'BIGINT' if dtype.kind in 'iu' else 'TEXT')
+                    conn.execute(text(f'ALTER TABLE daily_snapshots ADD COLUMN IF NOT EXISTS "{col}" {pg_type}'))
+            conn.execute(text('DELETE FROM daily_snapshots WHERE "Snapshot Date" = :d'), {"d": str(snapshot_date)})
+    snap_df.to_sql('daily_snapshots', engine, if_exists='append', index=False)
+    print(f"✅ -> daily_snapshots (+{len(snap_df)} rows for {snapshot_date}, older days untouched)")
 
-    today_df.to_sql('daily_snapshots', engine, if_exists='append', index=False)
-    print(f"✅ -> daily_snapshots (+{len(today_df)} rows for {SNAPSHOT_DATE}, older days untouched)")
-
+def _rebuild_derived_tables():
+    """Recomputes every derived table (Daily_Summary, trends, delta,
+    MTD summary, Overall_Dashboard, Track_*) from the full daily_snapshots
+    history currently in Postgres. Both a live run and a backfill call
+    this once, after all their snapshot rows are written."""
     master = pd.read_sql('SELECT * FROM daily_snapshots', engine)
     master['Snapshot Date'] = pd.to_datetime(master['Snapshot Date'])
     dates_logged = sorted(master['Snapshot Date'].unique())
@@ -574,6 +643,38 @@ def run_daily_tracker(raw_path: str, enrolled_path: str):
     _write(src_today_df, TABLE_MAP['Source_Today'])
 
     # ============================================================
+    # MONTH-TO-DATE SUMMARY — one row, unambiguous "as of today" view.
+    # Every number here is cumulative from the 1st of the month through
+    # SNAPSHOT_DATE (not a single day's activity) -- Delivered/Admissions
+    # were already computed that way; this just surfaces it as one clean
+    # row instead of making you read it off the bottom of a growing ledger.
+    # ============================================================
+    days_elapsed = (pd.Timestamp(latest_date).date() - pd.Timestamp(CYCLE_START).date()).days + 1
+
+    mtd_row = {
+        'As Of Date': today_label,
+        'Cycle Start': str(pd.Timestamp(CYCLE_START).date()),
+        'Days Elapsed In Cycle': days_elapsed,
+        'Total Delivered (MTD)': int(today_data['Delivered'].sum()),
+        'Total Workable (MTD)': int(today_data['Workable'].sum()),
+        'Total Prospect (MTD)': int(today_data['Prospect'].sum()),
+        'Total Fresh (MTD)': int(today_data['Fresh'].sum()),
+        'Total Junk (MTD)': int(today_data['Junk'].sum()),
+        'Total Admissions (MTD)': int(today_data['Total Adm'].sum()),
+    }
+    total_del = mtd_row['Total Delivered (MTD)']
+    mtd_row['Overall CVR % (MTD)'] = round(mtd_row['Total Admissions (MTD)'] / max(total_del, 1) * 100, 2)
+    mtd_row['Overall Junk % (MTD)'] = round(mtd_row['Total Junk (MTD)'] / max(total_del, 1) * 100, 2)
+
+    for src in SOURCES:
+        pfx = src.replace(' ', '_') + '_'
+        mtd_row[f'{src} Admissions (MTD)'] = int(today_data.get(f'{pfx}Total_Adm', pd.Series([0])).sum())
+        mtd_row[f'{src} Delivered (MTD)'] = int(today_data.get(f'{pfx}Delivered', pd.Series([0])).sum())
+
+    month_to_date_summary = pd.DataFrame([mtd_row])
+    _write(month_to_date_summary, TABLE_MAP['Month_To_Date_Summary'])
+
+    # ============================================================
     # FULL_DELTA_DETAIL — Branch x University x Segment level
     # ============================================================
     merge_keys = ['Branch', 'University', 'Segment']
@@ -634,12 +735,77 @@ def run_daily_tracker(raw_path: str, enrolled_path: str):
         track_df = pd.DataFrame(track_rows)
         _write(track_df, TABLE_MAP[track_table_names[source_name]])
 
-    print(f"\n🎉 Daily tracker complete for {SNAPSHOT_DATE}. History now spans {len(dates_logged)} day(s).")
+    return {
+        "days_in_history": len(dates_logged),
+        "dates_logged": [str(pd.Timestamp(d).date()) for d in dates_logged],
+    }
+
+
+def run_daily_tracker(raw_path: str, enrolled_path: str):
+    """Normal daily run: writes ONE row, for SNAPSHOT_DATE (derived from
+    the data itself -- max Created On / Modified On), then rebuilds every
+    derived table from the full history in Postgres."""
+    prep = _prepare_data(raw_path, enrolled_path)
+    snap_df = _build_snapshot_df(prep, as_of_date=None)
+    _upsert_snapshot(snap_df, prep['SNAPSHOT_DATE'])
+    print(f"✅ Step 3 snapshot rows built: {len(snap_df)}")
+
+    rebuild_info = _rebuild_derived_tables()
+    print(f"\n🎉 Daily tracker complete for {prep['SNAPSHOT_DATE']}. "
+          f"History now spans {rebuild_info['days_in_history']} day(s).")
 
     return {
-        "snapshot_date": str(SNAPSHOT_DATE),
-        "raw_snapshot_date": str(RAW_SNAPSHOT_DATE),
-        "enrolled_snapshot_date": str(ENROLLED_SNAPSHOT_DATE),
-        "days_in_history": len(dates_logged),
-        "today_rows": len(today_df),
+        "snapshot_date": str(prep['SNAPSHOT_DATE']),
+        "raw_snapshot_date": str(prep['RAW_SNAPSHOT_DATE']),
+        "enrolled_snapshot_date": str(prep['ENROLLED_SNAPSHOT_DATE']),
+        "days_in_history": rebuild_info['days_in_history'],
+        "today_rows": len(snap_df),
+        "backfilled": False,
+    }
+
+
+def backfill_daily_history(raw_path: str, enrolled_path: str, from_date=None):
+    """
+    Reconstructs one row per day from the 1st of the month (or `from_date`,
+    as 'YYYY-MM-DD') through SNAPSHOT_DATE, all from this ONE file, using
+    each lead's own Created On date as that day's cutoff.
+
+    IMPORTANT LIMITATION: Delivered and Admissions counts are accurate for
+    backfilled days (Created On is fixed and can't change after the fact).
+    Workable/Prospect/Fresh/Junk are NOT true historical records for
+    backfilled days -- they reflect each lead's CURRENT stage today, not
+    whatever stage it actually was on that historical day, because the
+    source file only has one live snapshot of stage, not a change history.
+    Rows from strictly-past days are tagged _backfilled=True in
+    daily_snapshots so this is always visible later and never silently
+    mixed in with real day-by-day captures. The day equal to SNAPSHOT_DATE
+    itself is a true live capture, not an approximation, and is tagged
+    _backfilled=False even when run through this function.
+    """
+    prep = _prepare_data(raw_path, enrolled_path)
+
+    start_date = pd.to_datetime(from_date).date() if from_date else pd.to_datetime(prep['CYCLE_START']).date()
+    end_date = prep['SNAPSHOT_DATE']
+
+    if start_date > end_date:
+        raise ValueError(f"from_date ({start_date}) is after the snapshot date ({end_date}).")
+
+    all_days = list(pd.date_range(start_date, end_date, freq='D').date)
+    print(f"🔁 Backfilling {len(all_days)} day(s): {start_date} -> {end_date}")
+
+    for d in all_days:
+        snap_df = _build_snapshot_df(prep, as_of_date=d)
+        _upsert_snapshot(snap_df, d)
+
+    rebuild_info = _rebuild_derived_tables()
+    print(f"\n🎉 Backfill complete. History now spans {rebuild_info['days_in_history']} day(s).")
+
+    return {
+        "snapshot_date": str(prep['SNAPSHOT_DATE']),
+        "raw_snapshot_date": str(prep['RAW_SNAPSHOT_DATE']),
+        "enrolled_snapshot_date": str(prep['ENROLLED_SNAPSHOT_DATE']),
+        "days_in_history": rebuild_info['days_in_history'],
+        "backfilled_days": len(all_days),
+        "backfilled_range": [str(start_date), str(end_date)],
+        "backfilled": True,
     }
