@@ -738,6 +738,7 @@ def _rebuild_derived_tables():
         "dates_logged": [str(pd.Timestamp(d).date()) for d in dates_logged],
     }
 
+
 def run_daily_tracker(raw_path: str, enrolled_path: str):
     """Normal daily run: writes ONE row, for SNAPSHOT_DATE (derived from
     the data itself -- max Created On / Modified On), then rebuilds every
