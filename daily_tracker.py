@@ -643,17 +643,15 @@ def _rebuild_derived_tables():
     _write(src_today_df, TABLE_MAP['Source_Today'])
 
     # ============================================================
-    # MONTH-TO-DATE SUMMARY — one row, unambiguous "as of today" view.
-    # Every number here is cumulative from the 1st of the month through
-    # SNAPSHOT_DATE (not a single day's activity) -- Delivered/Admissions
-    # were already computed that way; this just surfaces it as one clean
-    # row instead of making you read it off the bottom of a growing ledger.
+    # MONTH-TO-DATE SUMMARY — FIX INTEGRATED HERE
     # ============================================================
-    days_elapsed = (pd.Timestamp(latest_date).date() - pd.Timestamp(CYCLE_START).date()).days + 1
+    # FIX: Extract the first day of the active month dynamically based on dataset history records
+    computed_cycle_start = latest_date.replace(day=1)
+    days_elapsed = (pd.Timestamp(latest_date).date() - pd.Timestamp(computed_cycle_start).date()).days + 1
 
     mtd_row = {
         'As Of Date': today_label,
-        'Cycle Start': str(pd.Timestamp(CYCLE_START).date()),
+        'Cycle Start': str(pd.Timestamp(computed_cycle_start).date()),
         'Days Elapsed In Cycle': days_elapsed,
         'Total Delivered (MTD)': int(today_data['Delivered'].sum()),
         'Total Workable (MTD)': int(today_data['Workable'].sum()),
@@ -739,7 +737,6 @@ def _rebuild_derived_tables():
         "days_in_history": len(dates_logged),
         "dates_logged": [str(pd.Timestamp(d).date()) for d in dates_logged],
     }
-
 
 def run_daily_tracker(raw_path: str, enrolled_path: str):
     """Normal daily run: writes ONE row, for SNAPSHOT_DATE (derived from
