@@ -930,64 +930,45 @@ def run_pipeline(raw_path: str, enrolled_path: str, targets_path: str):
 
     # ============================================================
     # BRANCH TARGET EXTRACTION
+    # ------------------------------------------------------------
+    # Branch-level targets are hardcoded per branch (irrespective of
+    # university) and maintained by hand -- they no longer come from
+    # the "Branch-Product" sheet in the Targets workbook (that sheet
+    # mixed in per-university sub-rows under each branch, which meant
+    # a branch's target got summed once per university and appeared
+    # duplicated/inflated). Instead they live in the `branch_targets`
+    # table in Postgres, kept up to date via update_branch_targets.py.
+    # That also means these targets are still available even in a
+    # cycle where the Targets .xlsx doesn't have this sheet filled in.
     # ============================================================
 
-    branch_targets = {}
-    branch_channel_targets = {}  # {branch: {'PR': x, 'AI': y, 'WA': z}}
+    from database import engine as _targets_engine
 
-    current_branch = None
+    df_branch_raw = pd.read_sql(
+        'SELECT "VP", "Branch", "Overall Target", "PR Target", '
+        '"Web Target", "WA Target", "AI Target" FROM branch_targets',
+        _targets_engine,
+    )
 
-    for row in wb['Branch-Product'].iter_rows(values_only=True):
+    df_branch_raw['Branch'] = (
+        df_branch_raw['Branch'].astype(str).str.strip().map(
+            lambda b: BRANCH_FIX.get(b, b)
+        )
+    )
 
-        branch_cell = row[0]
-
-        if branch_cell == 'Branch':
-            continue
-
-        if branch_cell is not None:
-
-            current_branch = str(branch_cell).strip()
-
-            current_branch = BRANCH_FIX.get(
-                current_branch,
-                current_branch
-            )
-
-            if current_branch not in branch_targets:
-                branch_targets[current_branch] = 0
-
-            if current_branch not in branch_channel_targets:
-                branch_channel_targets[current_branch] = {'PR': 0, 'AI': 0, 'WA': 0}
-
-        if current_branch:
-            pr_target = parse_cell(row[2])
-            ai_target = parse_cell(row[3])
-            wa_target = parse_cell(row[4])
-
-            branch_targets[current_branch] += (
-                    pr_target + ai_target + wa_target
-            )
-
-            branch_channel_targets[current_branch]['PR'] += pr_target
-            branch_channel_targets[current_branch]['AI'] += ai_target
-            branch_channel_targets[current_branch]['WA'] += wa_target
+    branch_vp_lookup = dict(
+        zip(df_branch_raw['Branch'], df_branch_raw['VP'])
+    )
 
     # ============================================================
     # PER-BRANCH PR/AI/WA TARGET DF (feeds Enhanced Branch Report)
-    # Web has no source target anywhere in the targets workbook, so
-    # Web Target / Web Till Date Target / Web Deficit stay as "-"
-    # on every branch -- this is intentional, not a bug.
+    # Web target stays "-" unless you've actually filled in real
+    # numbers for it in the branch_targets table.
     # ============================================================
 
-    df_branch_channel_targets = pd.DataFrame([
-        {
-            'Branch': b,
-            'PR Target': vals['PR'],
-            'AI Target': vals['AI'],
-            'WA Target': vals['WA'],
-        }
-        for b, vals in branch_channel_targets.items()
-    ])
+    df_branch_channel_targets = df_branch_raw[
+        ['Branch', 'PR Target', 'AI Target', 'WA Target']
+    ].copy()
 
     for ch in ['PR', 'AI', 'WA']:
         df_branch_channel_targets[f'{ch} Till Date Target'] = round(
@@ -1004,19 +985,7 @@ def run_pipeline(raw_path: str, enrolled_path: str, targets_path: str):
     # CREATE BRANCH TARGET DF
     # ============================================================
 
-    df_branch_targets = pd.DataFrame(
-        list(branch_targets.items()),
-        columns=['Branch', 'Overall Target']
-    )
-
-    df_branch_targets = df_branch_targets[
-        ~df_branch_targets['Branch'].isin([
-            'Noida',
-            'Noida-1&2',
-            'Pune',
-            'Pune-1 & 2'
-        ])
-    ]
+    df_branch_targets = df_branch_raw[['Branch', 'Overall Target']].copy()
 
     df_branch_targets['Till Date Target'] = round(
         df_branch_targets['Overall Target']
@@ -1876,7 +1845,7 @@ def run_pipeline(raw_path: str, enrolled_path: str, targets_path: str):
             lambda r: (r['Till Date Target'] - r['Delivered']) if r['Till Date Target'] > 0 else 0,
             axis=1
         )
-        
+
         f_cols = ['Branch', 'University', 'Segment', 'Overall Target', 'Till Date Target', 'Remaining Target',
                   'Delivered', 'Workable', 'Prospect', 'Fresh', 'Junk', 'Current Adm', 'Spillover', 'Total Adm',
                   'CVR %', 'Junk %']
@@ -2528,8 +2497,16 @@ def run_pipeline(raw_path: str, enrolled_path: str, targets_path: str):
                       (branch_summary(rdmpl_df_out, 'RDMPL'), 'RDMPL')]:
         enhanced_branch = enhanced_branch.merge(df_b, on='Branch', how='left').fillna(0)
 
-    # Merge fixed VP-per-branch constant (see BRANCH_VP_MAP above)
-    enhanced_branch['VP'] = enhanced_branch['Branch'].map(BRANCH_VP_MAP).fillna('Unknown VP')
+    # VP-per-branch: prefer the VP column from the branch_targets table
+    # (branch_vp_lookup, single source of truth -- see BRANCH TARGET
+    # EXTRACTION above), falling back to the legacy BRANCH_VP_MAP constant
+    # only for a branch that's missing from branch_targets entirely.
+    enhanced_branch['VP'] = (
+        enhanced_branch['Branch']
+        .map(branch_vp_lookup)
+        .fillna(enhanced_branch['Branch'].map(BRANCH_VP_MAP))
+        .fillna('Unknown VP')
+    )
 
     # Merge per-channel branch targets (PR/AI/WA real, Web fixed at "-")
     channel_target_cols = [
